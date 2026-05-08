@@ -70,6 +70,23 @@ When you call the number, Twilio requests TwiML from `/twilio/voice`, then opens
 
 The server bridges that stream to OpenAI Realtime.
 
+## 5) Phase 1 memory with Postgres
+
+Memory tools are available when `MEMORY_ENABLED=true` and `DATABASE_URL` is set.
+
+- Uses a simple text-memory table in Postgres (Neon compatible)
+- Scopes memories by caller phone number
+- Exposes tools to the model:
+  - `save_memory`
+  - `search_memory`
+  - `get_recent_memories`
+
+Example env values:
+
+- `MEMORY_ENABLED=true`
+- `DATABASE_URL=postgresql://...` (include `sslmode=require` for Neon)
+- `MEMORY_RECENT_LIMIT=5`
+
 ## Notes and next steps
 
 - This is a practical starter for Step 1 in your plan.

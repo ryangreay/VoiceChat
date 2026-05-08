@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from typing import Optional
+from urllib.parse import parse_qs
 
 from ddgs import DDGS  # type: ignore[reportMissingImports]
 from dotenv import load_dotenv
@@ -9,6 +10,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 import websockets
 from websockets.exceptions import ConnectionClosed
+from app.memory_store import MemoryStore
 
 load_dotenv()
 
@@ -34,6 +36,13 @@ VAD_PREFIX_PADDING_MS = int(os.getenv("OPENAI_VAD_PREFIX_PADDING_MS", "300"))
 VAD_SILENCE_DURATION_MS = int(os.getenv("OPENAI_VAD_SILENCE_DURATION_MS", "900"))
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
 WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+MEMORY_RECENT_LIMIT = int(os.getenv("MEMORY_RECENT_LIMIT", "5"))
+
+memory_store: Optional[MemoryStore] = None
+if MEMORY_ENABLED and DATABASE_URL:
+    memory_store = MemoryStore(DATABASE_URL)
 
 
 @app.get("/health")
@@ -41,8 +50,15 @@ async def health() -> dict:
     return {"ok": True}
 
 
+@app.on_event("startup")
+async def startup_event() -> None:
+    if memory_store:
+        await asyncio.to_thread(memory_store.init_schema)
+        print("Memory store ready.")
+
+
 @app.post("/twilio/voice")
-async def twilio_voice(_: Request) -> PlainTextResponse:
+async def twilio_voice(request: Request) -> PlainTextResponse:
     if not PUBLIC_BASE_URL:
         return PlainTextResponse(
             "Set PUBLIC_BASE_URL in environment before handling live calls.",
@@ -50,11 +66,19 @@ async def twilio_voice(_: Request) -> PlainTextResponse:
         )
 
     stream_url = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+    body = (await request.body()).decode("utf-8")
+    form_data = parse_qs(body)
+    from_number = form_data.get("From", ["unknown"])[0]
+    call_sid = form_data.get("CallSid", [""])[0]
+
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Connecting you now.</Say>
   <Connect>
-    <Stream url="{stream_url}/twilio/media-stream" />
+    <Stream url="{stream_url}/twilio/media-stream">
+      <Parameter name="from_number" value="{from_number}" />
+      <Parameter name="call_sid" value="{call_sid}" />
+    </Stream>
   </Connect>
 </Response>"""
     return PlainTextResponse(twiml, media_type="application/xml")
@@ -83,12 +107,77 @@ async def send_openai_session_update(openai_ws) -> None:
                 },
             }
         )
+    if memory_store:
+        tools.extend(
+            [
+                {
+                    "type": "function",
+                    "name": "save_memory",
+                    "description": "Save a durable memory note about the caller for future calls.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "note": {
+                                "type": "string",
+                                "description": "Short durable memory about the caller.",
+                            },
+                            "tags": {
+                                "type": "string",
+                                "description": "Optional comma-separated tags for retrieval.",
+                            },
+                        },
+                        "required": ["note"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "type": "function",
+                    "name": "search_memory",
+                    "description": "Search past memories for this caller with text matching.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "What to look up in caller memory.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Optional max memory rows to return.",
+                            },
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "type": "function",
+                    "name": "get_recent_memories",
+                    "description": "Get most recent saved memories for this caller.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Optional max memory rows to return.",
+                            }
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            ]
+        )
 
     session_update = {
         "type": "session.update",
         "session": {
             "modalities": ["audio", "text"],
-            "instructions": f"{ASSISTANT_INSTRUCTIONS}\n\n{ASSISTANT_RESPONSE_POLICY}",
+            "instructions": (
+                f"{ASSISTANT_INSTRUCTIONS}\n\n"
+                f"{ASSISTANT_RESPONSE_POLICY}\n\n"
+                "When memory tools are available, use them to remember useful user preferences "
+                "and to look up relevant prior context."
+            ),
             "voice": OPENAI_VOICE,
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
@@ -160,20 +249,85 @@ async def run_web_search(query: str) -> dict:
         return {"query": query, "error": str(exc), "results": []}
 
 
-async def handle_tool_call(openai_ws, call_id: str, tool_name: str, arguments_raw: str) -> None:
-    if tool_name != "web_search":
-        output = {"error": f"Unknown tool: {tool_name}"}
-    else:
-        try:
-            args = json.loads(arguments_raw or "{}")
-        except json.JSONDecodeError:
-            args = {}
+def summarize_call_memory(
+    caller_id: str,
+    call_sid: str,
+    user_utterances: list[str],
+    assistant_utterances: list[str],
+) -> str:
+    user_preview = " | ".join(user_utterances[-3:]) if user_utterances else "No transcription captured."
+    assistant_preview = (
+        " | ".join(assistant_utterances[-3:]) if assistant_utterances else "No assistant transcript captured."
+    )
+    return (
+        f"Call summary for {caller_id}. "
+        f"CallSid: {call_sid or 'unknown'}. "
+        f"User said: {user_preview}. "
+        f"Assistant replied: {assistant_preview}."
+    )
+
+
+def clamp_limit(value: object, default: int = MEMORY_RECENT_LIMIT) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(10, parsed))
+
+
+async def handle_tool_call(
+    openai_ws,
+    call_id: str,
+    tool_name: str,
+    arguments_raw: str,
+    caller_id: str,
+) -> None:
+    try:
+        args = json.loads(arguments_raw or "{}")
+    except json.JSONDecodeError:
+        args = {}
+
+    if tool_name == "web_search":
         query = (args.get("query") or "").strip()
         if not query:
             output = {"error": "Missing required argument: query"}
         else:
             print(f"Tool call: web_search('{query}')")
             output = await run_web_search(query)
+    elif tool_name == "save_memory":
+        if not memory_store:
+            output = {"error": "Memory is disabled."}
+        else:
+            note = (args.get("note") or "").strip()
+            tags = (args.get("tags") or "").strip() or None
+            if not note:
+                output = {"error": "Missing required argument: note"}
+            else:
+                print(f"Tool call: save_memory for caller '{caller_id}'")
+                saved = await asyncio.to_thread(memory_store.save_memory, caller_id, note, tags)
+                output = {"ok": True, "saved": saved}
+    elif tool_name == "search_memory":
+        if not memory_store:
+            output = {"error": "Memory is disabled."}
+        else:
+            query = (args.get("query") or "").strip()
+            limit = clamp_limit(args.get("limit"), MEMORY_RECENT_LIMIT)
+            if not query:
+                output = {"error": "Missing required argument: query"}
+            else:
+                print(f"Tool call: search_memory('{query}') for caller '{caller_id}'")
+                rows = await asyncio.to_thread(memory_store.search_memory, caller_id, query, limit)
+                output = {"query": query, "results": rows}
+    elif tool_name == "get_recent_memories":
+        if not memory_store:
+            output = {"error": "Memory is disabled."}
+        else:
+            limit = clamp_limit(args.get("limit"), MEMORY_RECENT_LIMIT)
+            print(f"Tool call: get_recent_memories for caller '{caller_id}'")
+            rows = await asyncio.to_thread(memory_store.get_recent_memories, caller_id, limit)
+            output = {"results": rows}
+    else:
+        output = {"error": f"Unknown tool: {tool_name}"}
 
     await openai_ws.send(
         json.dumps(
@@ -199,7 +353,12 @@ async def twilio_media_stream(ws: WebSocket) -> None:
         return
 
     stream_sid: Optional[str] = None
+    caller_id = "unknown"
+    call_sid = ""
     media_packets = 0
+    user_utterances: list[str] = []
+    assistant_utterances: list[str] = []
+    call_memory_saved = False
 
     realtime_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
     headers = {
@@ -212,7 +371,7 @@ async def twilio_media_stream(ws: WebSocket) -> None:
             await send_openai_session_update(openai_ws)
 
             async def forward_twilio_to_openai() -> None:
-                nonlocal stream_sid, media_packets
+                nonlocal stream_sid, caller_id, call_sid, media_packets
                 try:
                     while True:
                         message = await ws.receive_text()
@@ -221,7 +380,11 @@ async def twilio_media_stream(ws: WebSocket) -> None:
 
                         if event == "start":
                             stream_sid = data.get("start", {}).get("streamSid")
+                            custom_params = data.get("start", {}).get("customParameters", {})
+                            caller_id = custom_params.get("from_number", "unknown")
+                            call_sid = custom_params.get("call_sid", "")
                             print(f"Twilio stream started: {stream_sid}")
+                            print(f"Caller id: {caller_id}")
                             await send_openai_initial_greeting(openai_ws)
                         elif event == "media":
                             payload = data.get("media", {}).get("payload")
@@ -239,6 +402,10 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                                 )
                         elif event == "stop":
                             print("Twilio stream stop received.")
+                            try:
+                                await openai_ws.close()
+                            except Exception:
+                                pass
                             break
                 except WebSocketDisconnect:
                     print("Twilio websocket disconnected.")
@@ -285,13 +452,33 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                                 call_id=event.get("call_id", ""),
                                 tool_name=event.get("name", ""),
                                 arguments_raw=event.get("arguments", "{}"),
+                                caller_id=caller_id,
                             )
+                        elif event_type == "conversation.item.input_audio_transcription.completed":
+                            transcript = (event.get("transcript") or "").strip()
+                            if transcript:
+                                user_utterances.append(transcript)
+                        elif event_type in {"response.audio_transcript.done", "response.output_audio_transcript.done"}:
+                            transcript = (event.get("transcript") or "").strip()
+                            if transcript:
+                                assistant_utterances.append(transcript)
                 except ConnectionClosed as exc:
                     print(f"OpenAI websocket closed: {exc}")
                 except Exception as exc:
                     print(f"OpenAI->Twilio forwarding error: {exc}")
 
-            await asyncio.gather(forward_twilio_to_openai(), forward_openai_to_twilio())
+            twilio_task = asyncio.create_task(forward_twilio_to_openai())
+            openai_task = asyncio.create_task(forward_openai_to_twilio())
+            done, pending = await asyncio.wait(
+                {twilio_task, openai_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                _ = task.exception()
     except Exception as exc:
         err_msg = str(exc)
         if "invalid_model" in err_msg:
@@ -303,5 +490,21 @@ async def twilio_media_stream(ws: WebSocket) -> None:
         else:
             print("Bridge runtime error:", exc)
     finally:
+        if memory_store and caller_id != "unknown" and not call_memory_saved:
+            note = summarize_call_memory(
+                caller_id=caller_id,
+                call_sid=call_sid,
+                user_utterances=user_utterances,
+                assistant_utterances=assistant_utterances,
+            )
+            try:
+                await asyncio.to_thread(memory_store.save_memory, caller_id, note, "auto-call-summary")
+                call_memory_saved = True
+                print(f"Auto-saved call summary for caller '{caller_id}'.")
+            except Exception as exc:
+                print(f"Failed to auto-save call summary: {exc}")
         if ws.client_state.name != "DISCONNECTED":
-            await ws.close()
+            try:
+                await ws.close()
+            except Exception:
+                pass
