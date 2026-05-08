@@ -3,6 +3,7 @@ import json
 import os
 from typing import Optional
 
+from ddgs import DDGS  # type: ignore[reportMissingImports]
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -31,6 +32,8 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 VAD_THRESHOLD = float(os.getenv("OPENAI_VAD_THRESHOLD", "0.6"))
 VAD_PREFIX_PADDING_MS = int(os.getenv("OPENAI_VAD_PREFIX_PADDING_MS", "300"))
 VAD_SILENCE_DURATION_MS = int(os.getenv("OPENAI_VAD_SILENCE_DURATION_MS", "900"))
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
+WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
 
 
 @app.get("/health")
@@ -58,6 +61,29 @@ async def twilio_voice(_: Request) -> PlainTextResponse:
 
 
 async def send_openai_session_update(openai_ws) -> None:
+    tools = []
+    if WEB_SEARCH_ENABLED:
+        tools.append(
+            {
+                "type": "function",
+                "name": "web_search",
+                "description": (
+                    "Search the web for recent or factual information and return concise results."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The user query to search for on the web.",
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+
     session_update = {
         "type": "session.update",
         "session": {
@@ -73,6 +99,7 @@ async def send_openai_session_update(openai_ws) -> None:
                 "silence_duration_ms": VAD_SILENCE_DURATION_MS,
                 "create_response": True,
             },
+            "tools": tools,
         },
     }
     await openai_ws.send(json.dumps(session_update))
@@ -105,6 +132,57 @@ async def send_openai_initial_greeting(openai_ws) -> None:
                             ),
                         }
                     ],
+                },
+            }
+        )
+    )
+    await send_openai_response_create(openai_ws)
+
+
+async def run_web_search(query: str) -> dict:
+    def _search() -> dict:
+        with DDGS() as ddgs:
+            rows = list(ddgs.text(query, max_results=WEB_SEARCH_MAX_RESULTS))
+        items = []
+        for row in rows[:WEB_SEARCH_MAX_RESULTS]:
+            items.append(
+                {
+                    "title": row.get("title", ""),
+                    "snippet": row.get("body", ""),
+                    "url": row.get("href", ""),
+                }
+            )
+        return {"query": query, "results": items}
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_search), timeout=8)
+    except Exception as exc:
+        return {"query": query, "error": str(exc), "results": []}
+
+
+async def handle_tool_call(openai_ws, call_id: str, tool_name: str, arguments_raw: str) -> None:
+    if tool_name != "web_search":
+        output = {"error": f"Unknown tool: {tool_name}"}
+    else:
+        try:
+            args = json.loads(arguments_raw or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        query = (args.get("query") or "").strip()
+        if not query:
+            output = {"error": "Missing required argument: query"}
+        else:
+            print(f"Tool call: web_search('{query}')")
+            output = await run_web_search(query)
+
+    await openai_ws.send(
+        json.dumps(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(output),
                 },
             }
         )
@@ -201,6 +279,13 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                         elif event_type == "error":
                             # Keep the call alive but surface errors in server logs.
                             print("OpenAI realtime error:", event)
+                        elif event_type == "response.function_call_arguments.done":
+                            await handle_tool_call(
+                                openai_ws=openai_ws,
+                                call_id=event.get("call_id", ""),
+                                tool_name=event.get("name", ""),
+                                arguments_raw=event.get("arguments", "{}"),
+                            )
                 except ConnectionClosed as exc:
                     print(f"OpenAI websocket closed: {exc}")
                 except Exception as exc:
