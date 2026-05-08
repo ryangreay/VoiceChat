@@ -27,6 +27,62 @@ class MemoryStore:
                     ON memory_entries (caller_id, created_at DESC);
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS caller_profiles (
+                        caller_id TEXT PRIMARY KEY,
+                        display_name TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
+    def get_caller_profile(self, caller_id: str) -> dict[str, Any] | None:
+        with psycopg.connect(self.database_url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT caller_id, display_name, created_at, updated_at
+                    FROM caller_profiles
+                    WHERE caller_id = %s;
+                    """,
+                    (caller_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "caller_id": row[0],
+            "display_name": row[1],
+            "created_at": row[2].isoformat() if row[2] else None,
+            "updated_at": row[3].isoformat() if row[3] else None,
+        }
+
+    def upsert_caller_name(self, caller_id: str, display_name: str) -> dict[str, Any]:
+        name = display_name.strip()
+        if not name:
+            raise ValueError("display_name must be non-empty")
+        with psycopg.connect(self.database_url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO caller_profiles (caller_id, display_name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (caller_id) DO UPDATE SET
+                        display_name = EXCLUDED.display_name,
+                        updated_at = NOW()
+                    RETURNING caller_id, display_name, created_at, updated_at;
+                    """,
+                    (caller_id, name),
+                )
+                row = cur.fetchone()
+        return {
+            "caller_id": row[0],
+            "display_name": row[1],
+            "created_at": row[2].isoformat() if row[2] else None,
+            "updated_at": row[3].isoformat() if row[3] else None,
+        }
 
     def save_memory(self, caller_id: str, note: str, tags: str | None = None) -> dict[str, Any]:
         with psycopg.connect(self.database_url, autocommit=True) as conn:

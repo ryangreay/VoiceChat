@@ -75,11 +75,13 @@ The server bridges that stream to OpenAI Realtime.
 Memory tools are available when `MEMORY_ENABLED=true` and `DATABASE_URL` is set.
 
 - Uses a simple text-memory table in Postgres (Neon compatible)
+- **`caller_profiles`** stores each caller’s preferred name (keyed by phone number). First calls ask for a name and use the **`save_caller_name`** tool; later calls greet by that name.
 - Scopes memories by caller phone number
 - Exposes tools to the model:
   - `save_memory`
   - `search_memory`
   - `get_recent_memories`
+  - `save_caller_name`
 
 Example env values:
 

@@ -45,6 +45,40 @@ if MEMORY_ENABLED and DATABASE_URL:
     memory_store = MemoryStore(DATABASE_URL)
 
 
+def build_session_instructions(
+    caller_profile: dict | None = None,
+    *,
+    include_caller_identity: bool = True,
+) -> str:
+    parts = [
+        ASSISTANT_INSTRUCTIONS,
+        ASSISTANT_RESPONSE_POLICY,
+    ]
+    if memory_store:
+        parts.append(
+            "When memory tools are available, use them for durable preferences and "
+            "to look up relevant prior notes from past calls."
+        )
+        if include_caller_identity:
+            if caller_profile and caller_profile.get("display_name"):
+                name = caller_profile["display_name"]
+                parts.append(
+                    f"Caller identity: this phone number is associated with the saved name '{name}'. "
+                    "Greet them using that name when the call opens. Do not ask for their name unless "
+                    "they say it is wrong or they want to change it. If they give a new preferred name, "
+                    "call save_caller_name immediately with the new name."
+                )
+            else:
+                parts.append(
+                    "Caller identity: there is no saved name yet for this phone number. "
+                    "After your opening greeting, politely ask what name they would like you to use. "
+                    "When they clearly state their preferred name, call save_caller_name once with "
+                    "that name (use the name they gave, not a nickname you invent). "
+                    "Then briefly acknowledge you will remember it."
+                )
+    return "\n\n".join(parts)
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True}
@@ -165,6 +199,25 @@ async def send_openai_session_update(openai_ws) -> None:
                         "additionalProperties": False,
                     },
                 },
+                {
+                    "type": "function",
+                    "name": "save_caller_name",
+                    "description": (
+                        "Save this caller's preferred name for future calls from this phone number. "
+                        "Call once when they clearly state how they want to be addressed."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Preferred name exactly as the caller gave it (first name or full name).",
+                            },
+                        },
+                        "required": ["name"],
+                        "additionalProperties": False,
+                    },
+                },
             ]
         )
 
@@ -172,12 +225,7 @@ async def send_openai_session_update(openai_ws) -> None:
         "type": "session.update",
         "session": {
             "modalities": ["audio", "text"],
-            "instructions": (
-                f"{ASSISTANT_INSTRUCTIONS}\n\n"
-                f"{ASSISTANT_RESPONSE_POLICY}\n\n"
-                "When memory tools are available, use them to remember useful user preferences "
-                "and to look up relevant prior context."
-            ),
+            "instructions": build_session_instructions(None, include_caller_identity=False),
             "voice": OPENAI_VOICE,
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
@@ -194,6 +242,21 @@ async def send_openai_session_update(openai_ws) -> None:
     await openai_ws.send(json.dumps(session_update))
 
 
+async def patch_session_for_caller(openai_ws, caller_profile: dict | None) -> None:
+    await openai_ws.send(
+        json.dumps(
+            {
+                "type": "session.update",
+                "session": {
+                    "instructions": build_session_instructions(
+                        caller_profile, include_caller_identity=True
+                    )
+                },
+            }
+        )
+    )
+
+
 async def send_openai_response_create(openai_ws) -> None:
     await openai_ws.send(
         json.dumps(
@@ -205,7 +268,23 @@ async def send_openai_response_create(openai_ws) -> None:
     )
 
 
-async def send_openai_initial_greeting(openai_ws) -> None:
+async def send_call_opening(openai_ws, caller_profile: dict | None) -> None:
+    if not memory_store:
+        prompt = (
+            "In English: greet the caller warmly in one short sentence, "
+            "then ask how you can help in one short sentence."
+        )
+    elif caller_profile and caller_profile.get("display_name"):
+        name = caller_profile["display_name"]
+        prompt = (
+            f"In English: greet {name} warmly by name in one short sentence, "
+            "then ask how you can help in one short sentence."
+        )
+    else:
+        prompt = (
+            "In English: give one warm, welcoming sentence. "
+            "Then ask what name they would like you to use for them, in one short sentence."
+        )
     await openai_ws.send(
         json.dumps(
             {
@@ -213,14 +292,7 @@ async def send_openai_initial_greeting(openai_ws) -> None:
                 "item": {
                     "type": "message",
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "In English, greet the caller warmly in one short sentence. His name is Ryan. "
-                            ),
-                        }
-                    ],
+                    "content": [{"type": "input_text", "text": prompt}],
                 },
             }
         )
@@ -326,6 +398,22 @@ async def handle_tool_call(
             print(f"Tool call: get_recent_memories for caller '{caller_id}'")
             rows = await asyncio.to_thread(memory_store.get_recent_memories, caller_id, limit)
             output = {"results": rows}
+    elif tool_name == "save_caller_name":
+        if not memory_store:
+            output = {"error": "Memory is disabled."}
+        else:
+            raw_name = (args.get("name") or "").strip()
+            if not raw_name:
+                output = {"error": "Missing required argument: name"}
+            else:
+                print(f"Tool call: save_caller_name('{raw_name}') for caller '{caller_id}'")
+                try:
+                    saved = await asyncio.to_thread(
+                        memory_store.upsert_caller_name, caller_id, raw_name
+                    )
+                    output = {"ok": True, "profile": saved}
+                except ValueError as exc:
+                    output = {"error": str(exc)}
     else:
         output = {"error": f"Unknown tool: {tool_name}"}
 
@@ -385,7 +473,20 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                             call_sid = custom_params.get("call_sid", "")
                             print(f"Twilio stream started: {stream_sid}")
                             print(f"Caller id: {caller_id}")
-                            await send_openai_initial_greeting(openai_ws)
+                            caller_profile = None
+                            if memory_store and caller_id != "unknown":
+                                caller_profile = await asyncio.to_thread(
+                                    memory_store.get_caller_profile, caller_id
+                                )
+                                if caller_profile:
+                                    print(
+                                        f"Caller profile loaded: name={caller_profile.get('display_name')}"
+                                    )
+                                else:
+                                    print("No caller profile yet; first-time greeting flow.")
+                            if memory_store:
+                                await patch_session_for_caller(openai_ws, caller_profile)
+                            await send_call_opening(openai_ws, caller_profile)
                         elif event == "media":
                             payload = data.get("media", {}).get("payload")
                             if payload:
