@@ -18,6 +18,7 @@ class MemoryStore:
                         note TEXT NOT NULL,
                         tags TEXT,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        embedding vector(1536)
                     );
                     """
                 )
@@ -27,6 +28,19 @@ class MemoryStore:
                     ON memory_entries (caller_id, created_at DESC);
                     """
                 )
+                try:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                except psycopg.Error:
+                    pass
+                try:
+                    cur.execute(
+                        """
+                        ALTER TABLE memory_entries
+                        ADD COLUMN IF NOT EXISTS embedding vector(1536);
+                        """
+                    )
+                except psycopg.Error:
+                    pass
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS caller_profiles (
@@ -101,6 +115,33 @@ class MemoryStore:
             "id": row[0] if row else None,
             "created_at": row[1].isoformat() if row and row[1] else None,
         }
+
+    def get_note_by_id(self, row_id: int) -> str | None:
+        with psycopg.connect(self.database_url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT note FROM memory_entries WHERE id = %s;
+                    """,
+                    (row_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return row[0]
+
+    def update_embedding(self, row_id: int, embedding: list[float]) -> None:
+        literal = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+        with psycopg.connect(self.database_url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE memory_entries
+                    SET embedding = %s::vector
+                    WHERE id = %s;
+                    """,
+                    (literal, row_id),
+                )
 
     def search_memory(self, caller_id: str, query: str, limit: int) -> list[dict[str, Any]]:
         with psycopg.connect(self.database_url, autocommit=True) as conn:

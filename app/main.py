@@ -6,10 +6,11 @@ from urllib.parse import parse_qs
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 import websockets
 from websockets.exceptions import ConnectionClosed
+from app.embeddings import embed_memory_entry_background
 from app.memory_store import MemoryStore
 from app.web_search import run_web_search
 
@@ -45,6 +46,9 @@ CALL_SUMMARY_ENABLED = os.getenv("CALL_SUMMARY_ENABLED", "true").lower() == "tru
 CALL_SUMMARY_MODEL = os.getenv("CALL_SUMMARY_MODEL", "gpt-4o-mini")
 CALL_SUMMARY_MAX_TOKENS = max(120, min(1200, int(os.getenv("CALL_SUMMARY_MAX_TOKENS", "400"))))
 CALL_SUMMARY_TEMPERATURE = float(os.getenv("CALL_SUMMARY_TEMPERATURE", "0.35"))
+MEMORY_EMBEDDINGS_ENABLED = os.getenv("MEMORY_EMBEDDINGS_ENABLED", "true").lower() == "true"
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+MEMORY_EMBEDDING_DIMS = max(256, min(3072, int(os.getenv("MEMORY_EMBEDDING_DIMS", "1536"))))
 # User-speech ASR for call summaries / logs; Realtime defaults transcription OFF without this.
 INPUT_AUDIO_TRANSCRIPTION_MODEL = os.getenv("INPUT_AUDIO_TRANSCRIPTION_MODEL", "whisper-1")
 INPUT_AUDIO_TRANSCRIPTION_LANGUAGE = os.getenv("INPUT_AUDIO_TRANSCRIPTION_LANGUAGE", "en").strip()
@@ -430,6 +434,25 @@ async def summarize_call_with_llm(
         )
 
 
+def schedule_memory_embedding(background_tasks: BackgroundTasks, row_id: Any) -> None:
+    if not MEMORY_EMBEDDINGS_ENABLED or not memory_store or not OPENAI_API_KEY:
+        return
+    if row_id is None:
+        return
+    try:
+        rid = int(row_id)
+    except (TypeError, ValueError):
+        return
+    background_tasks.add_task(
+        embed_memory_entry_background,
+        memory_store,
+        rid,
+        OPENAI_API_KEY,
+        OPENAI_EMBEDDING_MODEL,
+        expected_dims=MEMORY_EMBEDDING_DIMS,
+    )
+
+
 def clamp_limit(value: object, default: int = MEMORY_RECENT_LIMIT) -> int:
     try:
         parsed = int(value) if value is not None else default
@@ -444,6 +467,7 @@ async def handle_tool_call(
     tool_name: str,
     arguments_raw: str,
     caller_id: str,
+    background_tasks: BackgroundTasks,
 ) -> None:
     try:
         args = json.loads(arguments_raw or "{}")
@@ -468,6 +492,7 @@ async def handle_tool_call(
             else:
                 print(f"Tool call: save_memory for caller '{caller_id}'")
                 saved = await asyncio.to_thread(memory_store.save_memory, caller_id, note, tags)
+                schedule_memory_embedding(background_tasks, saved.get("id"))
                 output = {"ok": True, "saved": saved}
     elif tool_name == "search_memory":
         if not memory_store:
@@ -524,7 +549,7 @@ async def handle_tool_call(
 
 
 @app.websocket("/twilio/media-stream")
-async def twilio_media_stream(ws: WebSocket) -> None:
+async def twilio_media_stream(ws: WebSocket, background_tasks: BackgroundTasks) -> None:
     await ws.accept()
 
     if not OPENAI_API_KEY:
@@ -657,6 +682,7 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                                 tool_name=event.get("name", ""),
                                 arguments_raw=event.get("arguments", "{}"),
                                 caller_id=caller_id,
+                                background_tasks=background_tasks,
                             )
                         elif event_type == "conversation.item.input_audio_transcription.completed":
                             transcript = (event.get("transcript") or "").strip()
@@ -708,8 +734,11 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                 assistant_utterances=assistant_utterances,
             )
             try:
-                await asyncio.to_thread(memory_store.save_memory, caller_id, note, "auto-call-summary")
+                saved = await asyncio.to_thread(
+                    memory_store.save_memory, caller_id, note, "auto-call-summary"
+                )
                 call_memory_saved = True
+                schedule_memory_embedding(background_tasks, saved.get("id"))
                 print(f"Auto-saved call summary for caller '{caller_id}'.")
             except Exception as exc:
                 print(f"Failed to auto-save call summary: {exc}")
