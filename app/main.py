@@ -1,9 +1,10 @@
 import asyncio
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -38,6 +39,12 @@ WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 MEMORY_RECENT_LIMIT = int(os.getenv("MEMORY_RECENT_LIMIT", "5"))
+MEMORY_BOOTSTRAP_LIMIT = max(1, min(10, int(os.getenv("MEMORY_BOOTSTRAP_LIMIT", "4"))))
+MEMORY_BOOTSTRAP_NOTE_MAX_CHARS = max(200, min(2000, int(os.getenv("MEMORY_BOOTSTRAP_NOTE_MAX_CHARS", "500"))))
+CALL_SUMMARY_ENABLED = os.getenv("CALL_SUMMARY_ENABLED", "true").lower() == "true"
+CALL_SUMMARY_MODEL = os.getenv("CALL_SUMMARY_MODEL", "gpt-4o-mini")
+CALL_SUMMARY_MAX_TOKENS = max(120, min(1200, int(os.getenv("CALL_SUMMARY_MAX_TOKENS", "400"))))
+CALL_SUMMARY_TEMPERATURE = float(os.getenv("CALL_SUMMARY_TEMPERATURE", "0.35"))
 # User-speech ASR for call summaries / logs; Realtime defaults transcription OFF without this.
 INPUT_AUDIO_TRANSCRIPTION_MODEL = os.getenv("INPUT_AUDIO_TRANSCRIPTION_MODEL", "whisper-1")
 INPUT_AUDIO_TRANSCRIPTION_LANGUAGE = os.getenv("INPUT_AUDIO_TRANSCRIPTION_LANGUAGE", "en").strip()
@@ -54,10 +61,18 @@ def build_input_audio_transcription() -> dict:
     return cfg
 
 
+def _truncate_for_prompt(text: str, max_chars: int) -> str:
+    t = text.strip()
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 1].rstrip() + "…"
+
+
 def build_session_instructions(
     caller_profile: dict | None = None,
     *,
     include_caller_identity: bool = True,
+    recent_memories: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     parts = [
         ASSISTANT_INSTRUCTIONS,
@@ -68,6 +83,23 @@ def build_session_instructions(
             "When memory tools are available, use them for durable preferences and "
             "to look up relevant prior notes from past calls."
         )
+        if recent_memories:
+            lines: list[str] = []
+            for row in recent_memories:
+                note = _truncate_for_prompt(str(row.get("note") or ""), MEMORY_BOOTSTRAP_NOTE_MAX_CHARS)
+                if not note:
+                    continue
+                tag = (row.get("tags") or "").strip()
+                created = (row.get("created_at") or "").strip()
+                meta_parts = [p for p in (created, f"tags: {tag}" if tag else "") if p]
+                meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+                lines.append(f"- {note}{meta}")
+            if lines:
+                parts.append(
+                    "Prior notes about this caller from earlier interactions "
+                    "(use naturally when relevant; do not read aloud as a list unless asked):\n"
+                    + "\n".join(lines)
+                )
         if include_caller_identity:
             if caller_profile and caller_profile.get("display_name"):
                 name = caller_profile["display_name"]
@@ -253,14 +285,20 @@ async def send_openai_session_update(openai_ws) -> None:
     await openai_ws.send(json.dumps(session_update))
 
 
-async def patch_session_for_caller(openai_ws, caller_profile: dict | None) -> None:
+async def patch_session_for_caller(
+    openai_ws,
+    caller_profile: dict | None,
+    recent_memories: Optional[list[dict[str, Any]]] = None,
+) -> None:
     await openai_ws.send(
         json.dumps(
             {
                 "type": "session.update",
                 "session": {
                     "instructions": build_session_instructions(
-                        caller_profile, include_caller_identity=True
+                        caller_profile,
+                        include_caller_identity=True,
+                        recent_memories=recent_memories,
                     )
                 },
             }
@@ -311,7 +349,7 @@ async def send_call_opening(openai_ws, caller_profile: dict | None) -> None:
     await send_openai_response_create(openai_ws)
 
 
-def summarize_call_memory(
+def summarize_call_memory_fallback(
     caller_id: str,
     call_sid: str,
     user_utterances: list[str],
@@ -327,6 +365,69 @@ def summarize_call_memory(
         f"User said: {user_preview}. "
         f"Assistant replied: {assistant_preview}."
     )
+
+
+async def summarize_call_with_llm(
+    caller_id: str,
+    call_sid: str,
+    user_utterances: list[str],
+    assistant_utterances: list[str],
+) -> str:
+    if not CALL_SUMMARY_ENABLED or not OPENAI_API_KEY:
+        return summarize_call_memory_fallback(
+            caller_id, call_sid, user_utterances, assistant_utterances
+        )
+    if not user_utterances and not assistant_utterances:
+        return summarize_call_memory_fallback(
+            caller_id, call_sid, user_utterances, assistant_utterances
+        )
+
+    user_block = "\n".join(f"- {u}" for u in user_utterances) or "(none)"
+    assistant_block = "\n".join(f"- {a}" for a in assistant_utterances) or "(none)"
+    sys_prompt = (
+        "You compress phone-call transcripts into durable memory for a voice assistant. "
+        "Write 2-6 short bullet lines in English: factual topics, preferences, commitments, "
+        "and open threads. Omit filler and pleasantries. No dialogue quotes unless essential."
+    )
+    user_prompt = (
+        f"Caller id (reference only): {caller_id}\n"
+        f"CallSid: {call_sid or 'unknown'}\n\n"
+        f"User turns (chronological):\n{user_block}\n\n"
+        f"Assistant turns (chronological):\n{assistant_block}"
+    )
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CALL_SUMMARY_MODEL,
+        "temperature": CALL_SUMMARY_TEMPERATURE,
+        "max_tokens": CALL_SUMMARY_MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("no choices in chat completion response")
+        content = (choices[0].get("message") or {}).get("content") or ""
+        text = content.strip()
+        if not text:
+            raise ValueError("empty summary content")
+        return f"Call summary (CallSid: {call_sid or 'unknown'}).\n{text}"
+    except Exception as exc:
+        print(f"LLM call summary failed ({exc!r}); using transcript fallback.")
+        return summarize_call_memory_fallback(
+            caller_id, call_sid, user_utterances, assistant_utterances
+        )
 
 
 def clamp_limit(value: object, default: int = MEMORY_RECENT_LIMIT) -> int:
@@ -464,6 +565,7 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                             print(f"Twilio stream started: {stream_sid}")
                             print(f"Caller id: {caller_id}")
                             caller_profile = None
+                            recent_for_session: list[dict[str, Any]] = []
                             if memory_store and caller_id != "unknown":
                                 caller_profile = await asyncio.to_thread(
                                     memory_store.get_caller_profile, caller_id
@@ -474,8 +576,19 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                                     )
                                 else:
                                     print("No caller profile yet; first-time greeting flow.")
+                                recent_for_session = await asyncio.to_thread(
+                                    memory_store.get_recent_memories,
+                                    caller_id,
+                                    MEMORY_BOOTSTRAP_LIMIT,
+                                )
+                                if recent_for_session:
+                                    print(
+                                        f"Loaded {len(recent_for_session)} prior memory note(s) into session context."
+                                    )
                             if memory_store:
-                                await patch_session_for_caller(openai_ws, caller_profile)
+                                await patch_session_for_caller(
+                                    openai_ws, caller_profile, recent_for_session
+                                )
                             await send_call_opening(openai_ws, caller_profile)
                         elif event == "media":
                             payload = data.get("media", {}).get("payload")
@@ -588,7 +701,7 @@ async def twilio_media_stream(ws: WebSocket) -> None:
             print("Bridge runtime error:", exc)
     finally:
         if memory_store and caller_id != "unknown" and not call_memory_saved:
-            note = summarize_call_memory(
+            note = await summarize_call_with_llm(
                 caller_id=caller_id,
                 call_sid=call_sid,
                 user_utterances=user_utterances,
