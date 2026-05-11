@@ -4,13 +4,13 @@ import os
 from typing import Optional
 from urllib.parse import parse_qs
 
-from ddgs import DDGS  # type: ignore[reportMissingImports]
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 import websockets
 from websockets.exceptions import ConnectionClosed
 from app.memory_store import MemoryStore
+from app.web_search import run_web_search
 
 load_dotenv()
 
@@ -35,14 +35,23 @@ VAD_THRESHOLD = float(os.getenv("OPENAI_VAD_THRESHOLD", "0.6"))
 VAD_PREFIX_PADDING_MS = int(os.getenv("OPENAI_VAD_PREFIX_PADDING_MS", "300"))
 VAD_SILENCE_DURATION_MS = int(os.getenv("OPENAI_VAD_SILENCE_DURATION_MS", "900"))
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
-WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 MEMORY_RECENT_LIMIT = int(os.getenv("MEMORY_RECENT_LIMIT", "5"))
+# User-speech ASR for call summaries / logs; Realtime defaults transcription OFF without this.
+INPUT_AUDIO_TRANSCRIPTION_MODEL = os.getenv("INPUT_AUDIO_TRANSCRIPTION_MODEL", "whisper-1")
+INPUT_AUDIO_TRANSCRIPTION_LANGUAGE = os.getenv("INPUT_AUDIO_TRANSCRIPTION_LANGUAGE", "en").strip()
 
 memory_store: Optional[MemoryStore] = None
 if MEMORY_ENABLED and DATABASE_URL:
     memory_store = MemoryStore(DATABASE_URL)
+
+
+def build_input_audio_transcription() -> dict:
+    cfg: dict = {"model": INPUT_AUDIO_TRANSCRIPTION_MODEL}
+    if INPUT_AUDIO_TRANSCRIPTION_LANGUAGE:
+        cfg["language"] = INPUT_AUDIO_TRANSCRIPTION_LANGUAGE
+    return cfg
 
 
 def build_session_instructions(
@@ -126,7 +135,8 @@ async def send_openai_session_update(openai_ws) -> None:
                 "type": "function",
                 "name": "web_search",
                 "description": (
-                    "Search the web for recent or factual information and return concise results."
+                    "Search the web for recent or factual information. Returns a synthesized summary "
+                    "from fetched pages plus source titles and URLs."
                 ),
                 "parameters": {
                     "type": "object",
@@ -229,6 +239,7 @@ async def send_openai_session_update(openai_ws) -> None:
             "voice": OPENAI_VOICE,
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
+            "input_audio_transcription": build_input_audio_transcription(),
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": VAD_THRESHOLD,
@@ -298,27 +309,6 @@ async def send_call_opening(openai_ws, caller_profile: dict | None) -> None:
         )
     )
     await send_openai_response_create(openai_ws)
-
-
-async def run_web_search(query: str) -> dict:
-    def _search() -> dict:
-        with DDGS() as ddgs:
-            rows = list(ddgs.text(query, max_results=WEB_SEARCH_MAX_RESULTS))
-        items = []
-        for row in rows[:WEB_SEARCH_MAX_RESULTS]:
-            items.append(
-                {
-                    "title": row.get("title", ""),
-                    "snippet": row.get("body", ""),
-                    "url": row.get("href", ""),
-                }
-            )
-        return {"query": query, "results": items}
-
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_search), timeout=8)
-    except Exception as exc:
-        return {"query": query, "error": str(exc), "results": []}
 
 
 def summarize_call_memory(
@@ -559,6 +549,12 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                             transcript = (event.get("transcript") or "").strip()
                             if transcript:
                                 user_utterances.append(transcript)
+                                print(f"OpenAI user transcript: {transcript[:200]!r}")
+                        elif event_type == "conversation.item.input_audio_transcription.failed":
+                            print(
+                                "OpenAI input_audio_transcription failed:",
+                                event.get("error") or event,
+                            )
                         elif event_type in {"response.audio_transcript.done", "response.output_audio_transcript.done"}:
                             transcript = (event.get("transcript") or "").strip()
                             if transcript:
