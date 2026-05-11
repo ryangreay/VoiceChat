@@ -18,7 +18,6 @@ class MemoryStore:
                         note TEXT NOT NULL,
                         tags TEXT,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        embedding vector(1536)
                     );
                     """
                 )

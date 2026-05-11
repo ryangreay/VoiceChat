@@ -6,7 +6,7 @@ from urllib.parse import parse_qs
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -434,7 +434,13 @@ async def summarize_call_with_llm(
         )
 
 
-def schedule_memory_embedding(background_tasks: BackgroundTasks, row_id: Any) -> None:
+def schedule_memory_embedding(row_id: Any) -> None:
+    """
+    Queue embedding work on the running event loop.
+
+    FastAPI BackgroundTasks are not reliably executed after WebSocket handlers
+    finish, so we use asyncio.create_task + asyncio.to_thread instead.
+    """
     if not MEMORY_EMBEDDINGS_ENABLED or not memory_store or not OPENAI_API_KEY:
         return
     if row_id is None:
@@ -443,14 +449,36 @@ def schedule_memory_embedding(background_tasks: BackgroundTasks, row_id: Any) ->
         rid = int(row_id)
     except (TypeError, ValueError):
         return
-    background_tasks.add_task(
-        embed_memory_entry_background,
-        memory_store,
-        rid,
-        OPENAI_API_KEY,
-        OPENAI_EMBEDDING_MODEL,
-        expected_dims=MEMORY_EMBEDDING_DIMS,
-    )
+
+    store = memory_store
+
+    async def _run_embedding() -> None:
+        await asyncio.to_thread(
+            embed_memory_entry_background,
+            store,
+            rid,
+            OPENAI_API_KEY,
+            OPENAI_EMBEDDING_MODEL,
+            expected_dims=MEMORY_EMBEDDING_DIMS,
+        )
+
+    def _log_task_outcome(t: asyncio.Task[None]) -> None:
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            print(f"Memory embedding task cancelled for memory_entries.id={rid}.")
+        except Exception as exc:
+            print(f"Memory embedding task raised for memory_entries.id={rid}: {exc!r}")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        print("Memory embedding skipped: no running event loop.")
+        return
+
+    task = asyncio.create_task(_run_embedding(), name=f"embed-memory-{rid}")
+    task.add_done_callback(_log_task_outcome)
+    print(f"Queued memory embedding task for memory_entries.id={rid}")
 
 
 def clamp_limit(value: object, default: int = MEMORY_RECENT_LIMIT) -> int:
@@ -467,7 +495,6 @@ async def handle_tool_call(
     tool_name: str,
     arguments_raw: str,
     caller_id: str,
-    background_tasks: BackgroundTasks,
 ) -> None:
     try:
         args = json.loads(arguments_raw or "{}")
@@ -492,7 +519,7 @@ async def handle_tool_call(
             else:
                 print(f"Tool call: save_memory for caller '{caller_id}'")
                 saved = await asyncio.to_thread(memory_store.save_memory, caller_id, note, tags)
-                schedule_memory_embedding(background_tasks, saved.get("id"))
+                schedule_memory_embedding(saved.get("id"))
                 output = {"ok": True, "saved": saved}
     elif tool_name == "search_memory":
         if not memory_store:
@@ -549,7 +576,7 @@ async def handle_tool_call(
 
 
 @app.websocket("/twilio/media-stream")
-async def twilio_media_stream(ws: WebSocket, background_tasks: BackgroundTasks) -> None:
+async def twilio_media_stream(ws: WebSocket) -> None:
     await ws.accept()
 
     if not OPENAI_API_KEY:
@@ -682,7 +709,6 @@ async def twilio_media_stream(ws: WebSocket, background_tasks: BackgroundTasks) 
                                 tool_name=event.get("name", ""),
                                 arguments_raw=event.get("arguments", "{}"),
                                 caller_id=caller_id,
-                                background_tasks=background_tasks,
                             )
                         elif event_type == "conversation.item.input_audio_transcription.completed":
                             transcript = (event.get("transcript") or "").strip()
@@ -738,7 +764,7 @@ async def twilio_media_stream(ws: WebSocket, background_tasks: BackgroundTasks) 
                     memory_store.save_memory, caller_id, note, "auto-call-summary"
                 )
                 call_memory_saved = True
-                schedule_memory_embedding(background_tasks, saved.get("id"))
+                schedule_memory_embedding(saved.get("id"))
                 print(f"Auto-saved call summary for caller '{caller_id}'.")
             except Exception as exc:
                 print(f"Failed to auto-save call summary: {exc}")

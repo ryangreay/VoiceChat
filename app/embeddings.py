@@ -39,7 +39,7 @@ def embed_memory_entry_background(
     expected_dims: int = 1536,
 ) -> None:
     """
-    Sync task for FastAPI BackgroundTasks: load note by id, embed, write pgvector column.
+    Sync worker run via asyncio.to_thread: load note by id, embed, write pgvector column.
     """
     if not api_key.strip():
         print(f"Memory embedding skipped for id={row_id}: missing OPENAI_API_KEY.")
