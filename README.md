@@ -35,6 +35,10 @@ Minimum required env vars:
 
 - `OPENAI_API_KEY`
 - `PUBLIC_BASE_URL` (your externally reachable HTTPS URL, e.g. ngrok)
+- `OPENAI_REALTIME_MODEL` (default `gpt-realtime`; also try `gpt-realtime-2`)
+
+The app uses the **GA** Realtime API (not the removed beta `OpenAI-Beta: realtime=v1` interface).
+Deprecated preview models like `gpt-4o-realtime-preview` will not work.
 
 ## 2) Run the app
 

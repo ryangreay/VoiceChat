@@ -19,7 +19,7 @@ load_dotenv()
 app = FastAPI(title="VoiceChat", version="0.1.0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 ASSISTANT_INSTRUCTIONS = os.getenv(
     "ASSISTANT_INSTRUCTIONS",
     "You are a friendly peer-like assistant on a live phone call. Be warm, concise, and practical.",
@@ -63,6 +63,42 @@ def build_input_audio_transcription() -> dict:
     if INPUT_AUDIO_TRANSCRIPTION_LANGUAGE:
         cfg["language"] = INPUT_AUDIO_TRANSCRIPTION_LANGUAGE
     return cfg
+
+
+def build_turn_detection() -> dict:
+    return {
+        "type": "server_vad",
+        "threshold": VAD_THRESHOLD,
+        "prefix_padding_ms": VAD_PREFIX_PADDING_MS,
+        "silence_duration_ms": VAD_SILENCE_DURATION_MS,
+        "create_response": True,
+    }
+
+
+def build_realtime_session(
+    *,
+    instructions: str,
+    tools: list[dict],
+) -> dict:
+    """GA Realtime session shape (see OpenAI beta-to-GA migration guide)."""
+    return {
+        "type": "realtime",
+        "model": OPENAI_REALTIME_MODEL,
+        "instructions": instructions,
+        "output_modalities": ["audio"],
+        "audio": {
+            "input": {
+                "format": {"type": "audio/pcmu"},
+                "transcription": build_input_audio_transcription(),
+                "turn_detection": build_turn_detection(),
+            },
+            "output": {
+                "format": {"type": "audio/pcmu"},
+                "voice": OPENAI_VOICE,
+            },
+        },
+        "tools": tools,
+    }
 
 
 def _truncate_for_prompt(text: str, max_chars: int) -> str:
@@ -269,22 +305,10 @@ async def send_openai_session_update(openai_ws) -> None:
 
     session_update = {
         "type": "session.update",
-        "session": {
-            "modalities": ["audio", "text"],
-            "instructions": build_session_instructions(None, include_caller_identity=False),
-            "voice": OPENAI_VOICE,
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "input_audio_transcription": build_input_audio_transcription(),
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": VAD_THRESHOLD,
-                "prefix_padding_ms": VAD_PREFIX_PADDING_MS,
-                "silence_duration_ms": VAD_SILENCE_DURATION_MS,
-                "create_response": True,
-            },
-            "tools": tools,
-        },
+        "session": build_realtime_session(
+            instructions=build_session_instructions(None, include_caller_identity=False),
+            tools=tools,
+        ),
     }
     await openai_ws.send(json.dumps(session_update))
 
@@ -299,11 +323,12 @@ async def patch_session_for_caller(
             {
                 "type": "session.update",
                 "session": {
+                    "type": "realtime",
                     "instructions": build_session_instructions(
                         caller_profile,
                         include_caller_identity=True,
                         recent_memories=recent_memories,
-                    )
+                    ),
                 },
             }
         )
@@ -315,7 +340,7 @@ async def send_openai_response_create(openai_ws) -> None:
         json.dumps(
             {
                 "type": "response.create",
-                "response": {"modalities": ["audio", "text"]},
+                "response": {"output_modalities": ["audio"]},
             }
         )
     )
@@ -594,7 +619,6 @@ async def twilio_media_stream(ws: WebSocket) -> None:
     realtime_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
     }
 
     try:
@@ -700,8 +724,8 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                                     )
                                 )
                         elif event_type == "error":
-                            # Keep the call alive but surface errors in server logs.
-                            print("OpenAI realtime error:", event)
+                            err = event.get("error") or event
+                            print("OpenAI realtime error:", err)
                         elif event_type == "response.function_call_arguments.done":
                             await handle_tool_call(
                                 openai_ws=openai_ws,
@@ -743,11 +767,12 @@ async def twilio_media_stream(ws: WebSocket) -> None:
                 _ = task.exception()
     except Exception as exc:
         err_msg = str(exc)
-        if "invalid_model" in err_msg:
+        if "invalid_model" in err_msg or "model" in err_msg.lower():
             print(
-                "Bridge runtime error: invalid realtime model. "
+                "Bridge runtime error: realtime model or API mismatch. "
                 f"Current OPENAI_REALTIME_MODEL='{OPENAI_REALTIME_MODEL}'. "
-                "Set a valid realtime-capable model in your .env file."
+                "Use a GA model such as gpt-realtime or gpt-realtime-2, and ensure "
+                "you are not sending the deprecated OpenAI-Beta: realtime=v1 header."
             )
         else:
             print("Bridge runtime error:", exc)
