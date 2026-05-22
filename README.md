@@ -153,7 +153,7 @@ app/
   main.py          # FastAPI app, Twilio bridge, Realtime session, tools
   memory_store.py  # Postgres memory + caller profiles
   embeddings.py    # Background OpenAI embeddings for memory rows
-  web_search.py    # DDGS + trafilatura + optional summarization
+  web_search.py    # DDGS + markdownify + optional summarization
 ```
 
 ## Roadmap ideas

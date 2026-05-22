@@ -2,6 +2,7 @@ annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
 babel==2.18.0
+beautifulsoup4==4.14.3
 certifi==2026.4.22
 charset-normalizer==3.4.7
 click==8.3.3
@@ -19,6 +20,7 @@ idna==3.13
 jusText==3.0.2
 lxml==6.1.0
 lxml_html_clean==0.4.4
+markdownify==1.2.2
 primp==1.2.3
 psycopg==3.3.4
 psycopg-binary==3.3.4
@@ -30,9 +32,9 @@ pytz==2026.2
 PyYAML==6.0.3
 regex==2026.5.9
 six==1.17.0
+soupsieve==2.8.3
 starlette==1.0.0
 tld==0.13.2
-trafilatura==2.0.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2026.2

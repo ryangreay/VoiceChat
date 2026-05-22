@@ -1,18 +1,19 @@
 """
-Web search: DuckDuckGo results -> parallel HTTP fetch -> trafilatura extract -> LLM synthesis.
+Web search: DuckDuckGo results -> parallel HTTP fetch -> markdownify -> LLM synthesis.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-import trafilatura
-from ddgs import DDGS 
+from ddgs import DDGS
 from dotenv import load_dotenv
+from markdownify import markdownify as html_to_markdown
 
 load_dotenv()
 
@@ -29,12 +30,34 @@ WEB_SEARCH_SUMMARY_MODEL = os.getenv("WEB_SEARCH_SUMMARY_MODEL", "gpt-4o-mini")
 WEB_SEARCH_SUMMARY_MAX_TOKENS = int(os.getenv("WEB_SEARCH_SUMMARY_MAX_TOKENS", "1400"))
 WEB_SEARCH_SUMMARY_TEMPERATURE = float(os.getenv("WEB_SEARCH_SUMMARY_TEMPERATURE", "0.35"))
 
-_ua_contact = PUBLIC_BASE_URL.strip() or "not-configured"
-_default_user_agent = f"VoiceChat/1.0 (voice assistant; +{_ua_contact})"
-WEB_SEARCH_USER_AGENT = os.getenv("WEB_SEARCH_USER_AGENT", "").strip() or _default_user_agent
+# Chrome on Windows — many sites block non-browser or bot-like User-Agent strings.
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+WEB_SEARCH_USER_AGENT = os.getenv("WEB_SEARCH_USER_AGENT", "").strip() or _DEFAULT_USER_AGENT
+
+# Referer sent on page fetches (mimics traffic from a search engine).
+WEB_SEARCH_REFERER = os.getenv("WEB_SEARCH_REFERER", "https://www.google.com/").strip()
+# google = fixed referer above; origin = target site's origin (/{scheme}://{host}/).
+WEB_SEARCH_REFERER_MODE = os.getenv("WEB_SEARCH_REFERER_MODE", "google").strip().lower()
 
 WEB_SEARCH_LOG_PREVIEW_CHARS = max(
     0, int(os.getenv("WEB_SEARCH_LOG_PREVIEW_CHARS", "600"))
+)
+
+_STRIP_TAGS = ["script", "style", "noscript", "svg", "iframe", "head", "meta", "link"]
+
+_BOT_BLOCK_MARKERS = (
+    "cf-browser-verification",
+    "challenge-platform",
+    "captcha-delivery",
+    "access denied",
+    "please enable javascript",
+    "unusual traffic",
+    "verify you are human",
+    "bot detection",
 )
 
 
@@ -52,17 +75,70 @@ def _log_summary_preview(summary: str | None) -> None:
     print(f"[web_search] summary ({n} chars):\n{preview}")
 
 
-def _extract_main_text(html: str, url: str) -> str | None:
-    text = trafilatura.extract(
-        html,
-        url=url,
-        include_comments=False,
-        include_tables=True,
-        no_fallback=False,
-    )
+def _referer_for_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if WEB_SEARCH_REFERER_MODE == "origin":
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/"
+        return None
+    if WEB_SEARCH_REFERER_MODE == "google" and WEB_SEARCH_REFERER:
+        return WEB_SEARCH_REFERER
+    if WEB_SEARCH_REFERER:
+        return WEB_SEARCH_REFERER
+    return None
+
+
+def _fetch_headers(url: str) -> dict[str, str]:
+    """Browser-like headers to reduce bot blocks on page fetches."""
+    referer = _referer_for_url(url)
+    headers: dict[str, str] = {
+        "User-Agent": WEB_SEARCH_USER_AGENT,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site" if referer else "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "DNT": "1",
+    }
+    if referer:
+        headers["Referer"] = referer
+    if PUBLIC_BASE_URL.strip():
+        headers["From"] = PUBLIC_BASE_URL.strip()
+    return headers
+
+
+def _looks_like_bot_block(html: str) -> bool:
+    sample = html[:12000].lower()
+    return any(marker in sample for marker in _BOT_BLOCK_MARKERS)
+
+
+def _extract_main_text(html: str) -> str | None:
+    if _looks_like_bot_block(html):
+        return None
+    try:
+        text = html_to_markdown(
+            html,
+            heading_style="ATX",
+            bullets="-",
+            strip=_STRIP_TAGS,
+        )
+    except Exception:
+        return None
     if not text or not text.strip():
         return None
-    return text.strip()
+    text = re.sub(r"\n{3,}", "\n\n", text.strip())
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text
 
 
 def _cap_text(s: str, max_chars: int) -> str:
@@ -108,6 +184,7 @@ async def _fetch_one(
         try:
             resp = await client.get(
                 url,
+                headers=_fetch_headers(url),
                 follow_redirects=True,
                 timeout=WEB_SEARCH_HTTP_TIMEOUT,
             )
@@ -124,7 +201,11 @@ async def _fetch_one(
             out["fetch_error"] = str(exc)
             return out
 
-    extracted = await asyncio.to_thread(_extract_main_text, html, url)
+    if _looks_like_bot_block(html):
+        out["fetch_error"] = "bot_block_or_challenge_page"
+        return out
+
+    extracted = await asyncio.to_thread(_extract_main_text, html)
     if extracted:
         out["extracted_text"] = _cap_text(extracted, WEB_SEARCH_MAX_EXTRACT_CHARS)
     else:
@@ -148,7 +229,7 @@ async def _summarize_with_openai(query: str, numbered_sources: list[tuple[int, d
         part = (
             f"[{idx}] {title}\nURL: {url}\n"
             f"Search snippet: {snippet}\n"
-            f"Extracted page text:\n{ext if ext else '(none — rely on snippet only)'}\n"
+            f"Extracted page content (markdown):\n{ext if ext else '(none — rely on snippet only)'}\n"
         )
         if total_chars + len(part) > WEB_SEARCH_MAX_TOTAL_INPUT_CHARS:
             part = _cap_text(part, WEB_SEARCH_MAX_TOTAL_INPUT_CHARS - total_chars)
@@ -166,8 +247,10 @@ async def _summarize_with_openai(query: str, numbered_sources: list[tuple[int, d
         f'User search query: "{query}"\n\n'
         "Below are numbered sources. Write a synthesis that helps answer the query.\n\n"
         "Rules:\n"
-        "- Preserve concrete facts: numbers, dates, names, statistics, units, and hedges "
+        "- Preserve concrete facts: numbers, dates, names, times, statistics, units, and hedges "
         '("about", "approximately", "reportedly", "as of …").\n'
+        "- Extracts are full-page markdown; ignore nav/footer boilerplate but keep tables, "
+        "lists, and showtime-style data when present.\n"
         "- If sources conflict, state that briefly.\n"
         "- Do not invent facts. If the extracts are insufficient, say what is missing.\n"
         "- Use short paragraphs or labeled bullets. Prefer clarity over brevity when facts matter.\n"
@@ -235,7 +318,7 @@ def _fallback_digest(numbered: list[tuple[int, dict[str, Any]]]) -> str:
 
 async def run_web_search(query: str) -> dict[str, Any]:
     """
-    DDGS → fetch + trafilatura → optional OpenAI synthesis into `summary`.
+    DDGS → fetch + markdownify → optional OpenAI synthesis into `summary`.
     """
     print(f"[web_search] start query={query!r} max_results={WEB_SEARCH_MAX_RESULTS}")
     try:
@@ -262,15 +345,9 @@ async def run_web_search(query: str) -> dict[str, Any]:
         print(f"[web_search] ddgs[{i}] {u} — {t}")
 
     limits = httpx.Limits(max_connections=5, max_keepalive_connections=5)
-    headers = {
-        "User-Agent": WEB_SEARCH_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
     sem = asyncio.Semaphore(WEB_SEARCH_MAX_RESULTS)
 
     async with httpx.AsyncClient(
-        headers=headers,
         limits=limits,
         follow_redirects=True,
     ) as client:
