@@ -1,110 +1,167 @@
-# VoiceChat (Step 1 Bootstrap)
+# VoiceChat
 
-This project starts a phone-call conversational assistant using:
+A phone-call voice assistant that bridges **Twilio Media Streams** to the **OpenAI Realtime API (GA)**. Call a Twilio number and talk to an LLM in real time, with optional caller memory, web search, and post-call summaries.
 
-- Twilio Programmable Voice + Media Streams
-- OpenAI Realtime API (audio in/out)
-- FastAPI backend
+## What it does
 
-The initial goal is to call a Twilio phone number and have a live voice conversation with an LLM.
+```
+Caller → Twilio Phone → POST /twilio/voice (TwiML)
+                      → WebSocket /twilio/media-stream (μ-law audio)
+                      → OpenAI Realtime (gpt-realtime / gpt-realtime-2)
+                      → audio back to caller
+```
 
-## 1) Local setup (PowerShell)
+| Feature | Status |
+| --- | --- |
+| Live speech-to-speech on a phone call | ✅ |
+| OpenAI GA Realtime (`audio/pcmu` ↔ Twilio G.711 μ-law) | ✅ |
+| Server-side VAD and tool calling | ✅ |
+| Web search tool (DDGS + page extract + optional LLM summary) | ✅ |
+| Postgres memory (Neon-compatible) | ✅ optional |
+| Caller profiles + `save_caller_name` | ✅ with memory |
+| Auto call summary saved after each call | ✅ with memory |
+| pgvector embeddings (background worker) | ✅ stored; semantic search not wired yet |
+| Twilio webhook signature validation | ✅ when `TWILIO_AUTH_TOKEN` is set |
 
-1. Create a virtual environment:
+## Requirements
+
+- Python 3.12+
+- [Twilio](https://www.twilio.com/) account with a voice-capable phone number
+- [OpenAI API key](https://platform.openai.com/api-keys) with Realtime access
+- Public HTTPS URL for webhooks (e.g. [ngrok](https://ngrok.com/) for local dev)
+- Optional: [Neon](https://neon.tech/) or other Postgres for memory
+
+## Quick start (local)
+
+### 1. Clone and install
 
 ```powershell
+git clone https://github.com/<your-user>/VoiceChat.git
+cd VoiceChat
 python -m venv .venv
-```
-
-2. Activate it:
-
-```powershell
 .\.venv\Scripts\Activate.ps1
-```
-
-3. Install dependencies inside the venv:
-
-```powershell
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-4. Copy `.env.example` to `.env` and fill in values.
+### 2. Configure environment
 
-Minimum required env vars:
+```powershell
+copy .env.example .env
+```
 
-- `OPENAI_API_KEY`
-- `PUBLIC_BASE_URL` (your externally reachable HTTPS URL, e.g. ngrok)
-- `OPENAI_REALTIME_MODEL` (default `gpt-realtime`; also try `gpt-realtime-2`)
+Edit `.env`. Minimum for a working call:
 
-The app uses the **GA** Realtime API (not the removed beta `OpenAI-Beta: realtime=v1` interface).
-Deprecated preview models like `gpt-4o-realtime-preview` will not work.
+| Variable | Description |
+| --- | --- |
+| `OPENAI_API_KEY` | OpenAI secret key (server-side only) |
+| `PUBLIC_BASE_URL` | Public HTTPS base URL, no trailing slash (e.g. ngrok URL) |
+| `OPENAI_REALTIME_MODEL` | `gpt-realtime` (default) or `gpt-realtime-2` |
 
-## 2) Run the app
+For production webhooks, also set:
+
+| Variable | Description |
+| --- | --- |
+| `TWILIO_AUTH_TOKEN` | From Twilio Console → Account → API keys & tokens. Enables signature checks on `/twilio/voice`. |
+
+See `.env.example` for memory, web search, voice, and VAD tuning.
+
+### 3. Run
 
 ```powershell
 uvicorn app.main:app --reload --port 8000
 ```
 
-Health check:
+Health check: `GET http://localhost:8000/health`
 
-- `GET http://localhost:8000/health`
-
-## 3) Expose locally to Twilio
-
-Use ngrok (or similar):
+### 4. Expose to the internet
 
 ```powershell
 ngrok http 8000
 ```
 
-Set `PUBLIC_BASE_URL` to your ngrok HTTPS URL.
+Set `PUBLIC_BASE_URL` to the ngrok **HTTPS** URL (e.g. `https://abc123.ngrok-free.app`).
 
-## 4) Configure Twilio number
+### 5. Configure Twilio
 
-In Twilio Console for your phone number:
+In the Twilio Console, for your phone number → **Voice configuration**:
 
-- Voice webhook URL (A call comes in):  
-  `https://<your-public-host>/twilio/voice`
-- HTTP method: `POST`
+- **A call comes in:** Webhook `https://<PUBLIC_BASE_URL>/twilio/voice`, method **POST**
 
-When you call the number, Twilio requests TwiML from `/twilio/voice`, then opens a media stream to:
+On incoming calls, Twilio fetches TwiML, then opens a media stream to `wss://<host>/twilio/media-stream`.
 
-- `wss://<your-public-host>/twilio/media-stream`
+## Memory (optional)
 
-The server bridges that stream to OpenAI Realtime.
+Enable Postgres-backed tools and auto summaries:
 
-## 5) Phase 1 memory with Postgres
+```env
+MEMORY_ENABLED=true
+DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
+```
 
-Memory tools are available when `MEMORY_ENABLED=true` and `DATABASE_URL` is set.
+On startup the app creates `memory_entries` and `caller_profiles` tables (and attempts `vector` extension for embeddings).
 
-- Uses a simple text-memory table in Postgres (Neon compatible)
-- **`caller_profiles`** stores each caller’s preferred name (keyed by phone number). First calls ask for a name and use the **`save_caller_name`** tool; later calls greet by that name.
-- Scopes memories by caller phone number
-- Exposes tools to the model:
-  - `save_memory`
-  - `search_memory`
-  - `get_recent_memories`
-  - `save_caller_name`
+**Tools exposed to the model:**
 
-Example env values:
+- `save_memory` — durable notes about the caller
+- `search_memory` — text search over past notes
+- `get_recent_memories` — latest notes for session context
+- `save_caller_name` — store preferred name by phone number
 
-- `MEMORY_ENABLED=true`
-- `DATABASE_URL=postgresql://...` (include `sslmode=require` for Neon)
-- `MEMORY_RECENT_LIMIT=5`
+After each call, an LLM-generated summary is saved automatically (tag `auto-call-summary`).
 
-## Notes and next steps
+## Deployment (Fly.io)
 
-- This is a practical starter for Step 1 in your plan.
-- Current code is intentionally minimal and does not yet include:
-  - Twilio request signature validation
-  - rich logging/observability
-  - production-grade reconnection strategy
-  - persistent memory/tool calling
+This repo includes a `Dockerfile` and example `fly.toml`. Before deploying:
 
-Planned roadmap:
+1. Create your own Fly app: `fly apps create <your-app-name>` and set `app` in `fly.toml`.
+2. Set secrets on Fly (never in git):
 
-1. Stabilize call quality + error handling
-2. Add custom voice cloning/voice pipeline for your own voice
-3. Add Neon + pgvector memory summaries/retrieval
-4. Add tool calls (calendar/email/text workflows)
+   ```powershell
+   fly secrets set OPENAI_API_KEY=sk-... PUBLIC_BASE_URL=https://<your-app>.fly.dev TWILIO_AUTH_TOKEN=...
+   ```
+
+3. Optional: `fly secrets set DATABASE_URL=...` and `MEMORY_ENABLED=true`.
+
+GitHub Actions deploy (`.github/workflows/fly-deploy.yml`) expects `FLY_API_TOKEN` in repository secrets.
+
+## Realtime API notes
+
+- Uses the **GA** interface (no `OpenAI-Beta: realtime=v1` header).
+- Deprecated preview models (e.g. `gpt-4o-realtime-preview`) will not work.
+- Output modality is `["audio"]` only; transcripts use separate Realtime events.
+- Twilio μ-law is configured as `audio/pcmu` in session audio settings.
+
+## Security
+
+### Twilio webhook validation
+
+When `TWILIO_AUTH_TOKEN` is set, `POST /twilio/voice` validates the `X-Twilio-Signature` header against `PUBLIC_BASE_URL/twilio/voice`. Leave the token unset only for local experiments.
+
+### Logging and PII
+
+Server logs may include phone numbers (`Caller id`), transcripts, and tool arguments. Treat logs as sensitive. Avoid shipping logs to public systems without redaction.
+
+### Web search
+
+The `web_search` tool fetches arbitrary URLs from the public internet. Run with `WEB_SEARCH_ENABLED=false` if you do not want outbound HTTP from your server.
+
+## Project layout
+
+```
+app/
+  main.py          # FastAPI app, Twilio bridge, Realtime session, tools
+  memory_store.py  # Postgres memory + caller profiles
+  embeddings.py    # Background OpenAI embeddings for memory rows
+  web_search.py    # DDGS + trafilatura + optional summarization
+```
+
+## Roadmap ideas
+
+- Semantic memory search over embeddings
+- Similar functionality over sms/rcs. Requires A2P 10DLC approval on twilio
+- Stronger web search / deep research. For example, checking the weather, checking and booking movie times, etc
+
+## License
+
+MIT — see [LICENSE](LICENSE).

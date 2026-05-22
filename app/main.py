@@ -1,8 +1,11 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 from typing import Any, Optional
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 from dotenv import load_dotenv
@@ -19,6 +22,7 @@ load_dotenv()
 app = FastAPI(title="VoiceChat", version="0.1.0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 ASSISTANT_INSTRUCTIONS = os.getenv(
     "ASSISTANT_INSTRUCTIONS",
@@ -56,6 +60,37 @@ INPUT_AUDIO_TRANSCRIPTION_LANGUAGE = os.getenv("INPUT_AUDIO_TRANSCRIPTION_LANGUA
 memory_store: Optional[MemoryStore] = None
 if MEMORY_ENABLED and DATABASE_URL:
     memory_store = MemoryStore(DATABASE_URL)
+
+
+def _xml_attr(value: str) -> str:
+    """Escape a value for use in a TwiML XML attribute."""
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _flat_form_params(form_data: dict[str, list[str]]) -> dict[str, str]:
+    return {k: (v[0] if v else "") for k, v in form_data.items()}
+
+
+def _validate_twilio_signature(
+    signature: str,
+    url: str,
+    params: dict[str, str],
+) -> bool:
+    if not TWILIO_AUTH_TOKEN or not signature:
+        return False
+    payload = url + urlencode(sorted(params.items()))
+    digest = hmac.new(
+        TWILIO_AUTH_TOKEN.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha1,
+    ).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
 
 
 def build_input_audio_transcription() -> dict:
@@ -183,16 +218,27 @@ async def twilio_voice(request: Request) -> PlainTextResponse:
     stream_url = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
     body = (await request.body()).decode("utf-8")
     form_data = parse_qs(body)
-    from_number = form_data.get("From", ["unknown"])[0]
-    call_sid = form_data.get("CallSid", [""])[0]
+    params = _flat_form_params(form_data)
+
+    if TWILIO_AUTH_TOKEN:
+        signature = request.headers.get("X-Twilio-Signature", "")
+        webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}/twilio/voice"
+        if not _validate_twilio_signature(signature, webhook_url, params):
+            return PlainTextResponse("Invalid Twilio signature.", status_code=403)
+
+    from_number = params.get("From", "unknown")
+    call_sid = params.get("CallSid", "")
+    safe_from = _xml_attr(from_number)
+    safe_sid = _xml_attr(call_sid)
+    safe_stream_url = _xml_attr(f"{stream_url}/twilio/media-stream")
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Connecting you now.</Say>
   <Connect>
-    <Stream url="{stream_url}/twilio/media-stream">
-      <Parameter name="from_number" value="{from_number}" />
-      <Parameter name="call_sid" value="{call_sid}" />
+    <Stream url="{safe_stream_url}">
+      <Parameter name="from_number" value="{safe_from}" />
+      <Parameter name="call_sid" value="{safe_sid}" />
     </Stream>
   </Connect>
 </Response>"""

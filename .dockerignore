@@ -1,5 +1,13 @@
-fly.toml
 .git/
-__pycache__/
-.envrc
+.github/
 .venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.envrc
+fly.toml
+README.md
+project-instructions.txt
+.cursorignore

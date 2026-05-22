@@ -1,9 +1,7 @@
-# fly.toml app configuration file generated for voicechat-glowing-frost-5153 on 2026-05-07T20:24:33-07:00
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# See https://fly.io/docs/reference/configuration/
+# Replace app name after: fly apps create <your-app-name>
 
-app = 'voicechat-glowing-frost-5153'
+app = 'voicechat'
 primary_region = 'sjc'
 
 [build]
