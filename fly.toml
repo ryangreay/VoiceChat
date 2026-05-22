@@ -1,7 +1,7 @@
 # See https://fly.io/docs/reference/configuration/
 # Replace app name after: fly apps create <your-app-name>
 
-app = 'voicechat'
+app = 'voicechat-glowing-frost-5153'
 primary_region = 'sjc'
 
 [build]
